@@ -1,0 +1,9 @@
+# deapman-thin build outputs
+deapman-thin/zig-out/
+deapman-thin/.zig-cache/
+# runtime / test leftovers
+/tmp/deapman-test.*
+/tmp/thin-test.*
+# release artifacts
+*.AppImage
+dist/

@@ -1,0 +1,540 @@
+#!/usr/bin/env bash
+# deapman-dedup.am — inventory + thin repack (symlink / wrapper backends).
+# Sourced standalone by `deapman dedup|thin`; owns $DEAPMAN_HOME analysis.
+# License: GPL-3.0-or-later (fork of ivan-hc/AM).
+#
+# Backend contract:
+#   _deapman_thin_symlink <appdir>  → IMPLEMENTADO: extrae el original a
+#       staging (mismo FS), mueve una copia de cada hash duplicado a
+#       $DEAPMAN_COMMON/<hh>/<sha>, sustituye por symlinks absolutos,
+#       reempaqueta con appimagetool (fork pkgforge, DwarFS) + uruntime,
+#       verifica (magia, árbol idéntico, symlinks resolubles, original
+#       intacto) y escribe refs/mode/thin en el manifest. rc 0 ok.
+#   _deapman_thin_wrapper <appdir>  → NO implementado (solo sharun conocido).
+# Exclusion list (never thin): AppRun* sharun* *.desktop icons ld-linux*
+#   lib.path .env hooks bin/* sbin/* usr/bin/* usr/sbin/* *.exe, más todo
+#   fichero ejecutable (+x) que no sea librería (.so*): un binario lanzable
+#   puede autolocalizar recursos vía /proc/self/exe o argv[0] (JVM, Qt,
+#   Electron...) y romperse al resolverse dentro de common/.
+#   Only byte-identical files (sha256) merge; same name with different
+#   hash NEVER merges.
+# Thin tools: appimagetool pkgforge 0.3.3 + uruntime dwarfs-lite v0.5.6 en
+#   $DEAPMAN_CACHE/tools/ (solo red en primera descarga). appimagetool trae
+#   su propio mkdwarfs/uruntime a $TMPDIR si no se le pasan --mkdwarfs/
+#   --runtime; el backend pasa ambos si existen y, si --runtime falla,
+#   reintenta sin él (runtime preferido de appimagetool). NOTA: este fork
+#   usa --runtime/--name; --runtime-file/-n son del AppImageKit clásico
+#   y aquí NO existen.
+
+# ---------- environment (mirrors deapman.am; this module sources standalone) ----------
+DEAPMAN_HOME="${DEAPMAN_HOME:-${DAP_HOME:-$DATADIR/deapman}}"
+DEAPMAN_APPS="$DEAPMAN_HOME/apps"
+DEAPMAN_ORIG="$DEAPMAN_HOME/originals"
+DEAPMAN_COMMON="$DEAPMAN_HOME/common"
+DEAPMAN_CACHE="$DEAPMAN_HOME/cache"
+DEAPMAN_TMP="$DEAPMAN_HOME/tmp"
+DEAPMAN_MIN_THIN_BYTES="${DEAPMAN_MIN_THIN_BYTES:-32768}"
+
+_deapman_ensure_dirs() {
+	mkdir -p "$DEAPMAN_APPS" "$DEAPMAN_ORIG" "$DEAPMAN_COMMON" "$DEAPMAN_CACHE" "$DEAPMAN_TMP" "$BINDIR" || {
+		echo "deapman: error: cannot create directories in $DEAPMAN_HOME" >&2
+		return 1
+	}
+}
+
+_deapman_err() { echo "deapman: error: $*" >&2; }
+_deapman_note() { echo "deapman: $*" >&2; }
+
+_deapman_appdir() {
+	[ -n "$1" ] || return 1
+	[ -d "$DEAPMAN_APPS/$1" ] && { printf '%s' "$DEAPMAN_APPS/$1"; return 0; }
+	for m in "$DEAPMAN_APPS"/*/manifest; do
+		[ -f "$m" ] || continue
+		# shellcheck disable=SC1090
+		if ( unset nick name; . "$m"; [ "${nick:-}" = "$1" ] ); then
+			printf '%s' "$(dirname "$m")"
+			return 0
+		fi
+	done
+	return 1
+}
+
+_deapman_app_field() { # <appdir> <field> → value
+	# shellcheck disable=SC1090
+	( unset name nick version origin mode thin sha_orig updated refs; . "$1/manifest"; eval "printf '%s' \"\${$2:-}\"" )
+}
+
+# Files that must NEVER be thinned (globs against the in-AppDir relative path).
+_deapman_excluded() { # <relpath> [fullpath]
+	case "$1" in
+		AppRun*|sharun*|*.desktop|*.png|*.svg|*.xpm|.DirIcon|\
+		*ld-linux*|lib.path|.env|*.hook|*.env|\
+		bin/*|sbin/*|usr/bin/*|usr/sbin/*|*.exe|*.EXE) return 0 ;;
+	esac
+	# Un ejecutable lanzable nunca se adelgaza: la app puede
+	# autolocalizar recursos vía /proc/self/exe o argv[0] (JVM,
+	# Qt, Electron...) y romperse al resolverse dentro de common/.
+	# Las .so se cargan por mmap y son seguras aunque tengan +x.
+	if [ -n "${2:-}" ]; then
+		case "$1" in *.so|*.so.*) :;; *)
+			[ -x "$2" ] && return 0 ;;
+		esac
+	fi
+	return 1
+}
+
+# ---------- inventory ----------
+# Per-app files in inventory.d/<app>.tsv, concatenated to inventory.tsv
+# (formato: app<TAB>path<TAB>size<TAB>sha256). Permite refresco parcial y
+# lotes paralelos: cada worker escribe su propio fichero.
+_deapman_inventory_one() { # <appdir> <outfile> → 0 (outfile puede quedar vacío)
+	_d="$1"; _out="$2"; : >"$_out"
+	_n=$(basename "$_d")
+	# Inventario siempre desde el ORIGINAL: el thin contiene symlinks a
+	# common/ que `find -type f` saltaría, y re-thinear desde el thin
+	# perdería duplicados ya adelgazados (regresión al añadir apps).
+	_img="$DEAPMAN_ORIG/$_n/app.orig.AppImage"; [ -x "$_img" ] || _img="$_d/app.thin.AppImage"
+	[ -x "$_img" ] || { _deapman_note "sin AppImage para $_n, salto"; return 0; }
+	_st="$DEAPMAN_TMP/inv-$$-$_n"; rm -rf "$_st"; mkdir -p "$_st" || return 1
+	( cd "$_st" && "$_img" --appimage-extract >/dev/null 2>&1 ) || {
+		_deapman_note "$_n: extracción no soportada (¿type1/antiguo?), salto"
+		rm -rf "$_st"; return 0
+	}
+	_exdir=""; for _c in squashfs-root AppDir; do [ -d "$_st/$_c" ] && _exdir="$_c" && break; done
+	[ -n "$_exdir" ] || { _deapman_note "$_n: sin AppDir tras extraer"; rm -rf "$_st"; return 0; }
+	( cd "$_st/$_exdir" && find . -type f -exec sha256sum {} + 2>/dev/null ) | \
+		awk -v app="$_n" '{sha=$1; $1=""; sub(/^ /,""); printf "%s\t%s\t%s\n", app, substr($0,3), sha}' | \
+		while IFS="$(printf '\t')" read -r _app _p _h; do
+			_s=$(wc -c <"$_st/$_exdir/$_p" 2>/dev/null | tr -d ' ')
+			printf '%s\t%s\t%s\t%s\n' "$_app" "$_p" "${_s:-0}" "$_h" >>"$_out"
+		done
+	rm -rf "$_st"
+	return 0
+}
+
+_deapman_inventory_concat() {
+	: >"$DEAPMAN_HOME/inventory.tsv"
+	for _f in "$DEAPMAN_HOME/inventory.d/"*.tsv; do
+		[ -f "$_f" ] || continue
+		cat "$_f" >>"$DEAPMAN_HOME/inventory.tsv"
+	done
+	_c=$(wc -l <"$DEAPMAN_HOME/inventory.tsv" 2>/dev/null | tr -d ' ')
+	_deapman_note "inventario: ${_c:-0} ficheros en $DEAPMAN_HOME/inventory.tsv"
+	return 0
+}
+
+_deapman_inventory() { # [name...] (vacío = todo; con nombres = refresca solo esos)
+	_deapman_ensure_dirs || return 1
+	mkdir -p "$DEAPMAN_HOME/inventory.d" || return 1
+	if [ "$#" -gt 0 ]; then
+		for _w in "$@"; do
+			_d=$(_deapman_appdir "$_w" 2>/dev/null) || { _deapman_note "no instalado: $_w"; continue; }
+			_deapman_inventory_one "$_d" "$DEAPMAN_HOME/inventory.d/$(basename "$_d").tsv" || return 1
+		done
+	else
+		# Reanuda: solo faltantes o con manifest más nuevo (DEAPMAN_FORCE=1
+		# lo rehace todo). Nada ya inventariado se vuelve a extraer.
+		for _d in "$DEAPMAN_APPS"/*; do
+			[ -d "$_d" ] || continue
+			_bn=$(basename "$_d"); _tsv="$DEAPMAN_HOME/inventory.d/$_bn.tsv"
+			if [ -z "${DEAPMAN_FORCE:-}" ] && [ -f "$_tsv" ] && \
+			   [ "$_tsv" -nt "$_d/manifest" ]; then continue; fi
+			_deapman_inventory_one "$_d" "$_tsv" || return 1
+		done
+	fi
+	_deapman_inventory_concat
+	return 0
+}
+
+# ---------- dedup report + thin dispatch ----------
+_deapman_dedup() { # [-s|-w] [name...]
+	_mode="report"; _backend=""
+	[ "${1:-}" = "-s" ] && { _mode="symlink"; _backend="_deapman_thin_symlink"; shift; }
+	[ "${1:-}" = "-w" ] && { _mode="wrapper"; _backend="_deapman_thin_wrapper"; shift; }
+	_deapman_inventory "$@" || return 1
+	[ -s "$DEAPMAN_HOME/inventory.tsv" ] || { _deapman_err "inventario vacío"; return 1; }
+	if [ -n "${DEAPMAN_THIN:-}" ] && [ -x "$DEAPMAN_THIN" ] && \
+	   "$DEAPMAN_THIN" dups "$DEAPMAN_HOME/inventory.tsv" 2>/dev/null; then
+		: # reporte nativo (formato idéntico al awk)
+	else
+	awk -F'\t' '{print $4"\t"$3"\t"$1"\t"$2}' "$DEAPMAN_HOME/inventory.tsv" | sort | \
+	awk -F'\t' '
+	{ h=$1; sz=$2+0; apps[h]=apps[h] " " $3; n[h]++; bytes[h]=sz }
+	END {
+		dups=0; saved=0
+		for (h in n) if (n[h]>1 && bytes[h]>=32768) {
+			dups++; saved+=bytes[h]*(n[h]-1)
+			printf "dup %d× %s B  sha:%s  en:%s\n", n[h], bytes[h], substr(h,1,12), apps[h]
+		}
+		printf "TOTAL: %d ficheros duplicados, ahorro potencial %d B\n", dups, saved
+	}' | sort -rn -k2 | head -40
+	fi
+	if [ -n "$_backend" ]; then
+		if type "$_backend" >/dev/null 2>&1; then
+			_fail=0
+			for _d in "$DEAPMAN_APPS"/*; do
+				[ -d "$_d" ] || continue
+				if [ "$#" -gt 0 ]; then
+					_skip=1; _bn=$(basename "$_d")
+					for _w in "$@"; do _deapman_appdir "$_w" 2>/dev/null | grep -q "/$_bn\$" && _skip=0; done
+					[ "$_skip" -eq 1 ] && continue
+				fi
+				# Recicla: ya-thin en este modo → salto (DEAPMAN_FORCE=1 lo rehace).
+				# Cada thin terminado queda inmediatamente funcional.
+				if [ -z "${DEAPMAN_FORCE:-}" ] && [ -f "$_d/app.thin.AppImage" ] && \
+				   ( unset mode thin; . "$_d/manifest"; [ "${mode:-}" = "$_mode" ] && [ "${thin:-0}" = 1 ] ); then
+					_deapman_note "$(basename "$_d"): ya thin ($_mode), salto"
+					continue
+				fi
+				"$_backend" "$_d" || _fail=$((_fail+1))
+			done
+			[ "$_fail" -gt 0 ] && { _deapman_err "$_fail apps fallaron en modo $_mode"; return 1; }
+		else
+			_deapman_note "modo $_mode: backend aún no implementado en este hito"
+			return 2
+		fi
+	fi
+	return 0
+}
+
+# ---------- thin tools (appimagetool pkgforge + uruntime, cacheados) ----------
+# Solo hay red aquí (primera descarga a $DEAPMAN_CACHE/tools/). Técnica de
+# referencia (solo lectura): quick-sharun.sh::_make_appimage + uruntime2appimage.sh
+# en /home/dicov/Anylinux-AppImages/useful-tools (pins y flags del fork).
+_deapman_thin_dl() { # <url> <dest> — curl con fallback a wget; rc 4 sin red
+	_dl_u="$1"; _dl_f="$2"
+	if command -v curl >/dev/null 2>&1; then
+		curl -fSL --retry 3 -o "$_dl_f" "$_dl_u" 2>"$_dl_f.dlerr" || {
+			_deapman_err "descarga fallida: $_dl_u ($(head -c 200 "$_dl_f.dlerr" 2>/dev/null))"
+			rm -f "$_dl_f" "$_dl_f.dlerr"; return 4
+		}
+	elif command -v wget >/dev/null 2>&1; then
+		wget -O "$_dl_f" "$_dl_u" 2>"$_dl_f.dlerr" || {
+			_deapman_err "descarga fallida: $_dl_u ($(head -c 200 "$_dl_f.dlerr" 2>/dev/null))"
+			rm -f "$_dl_f" "$_dl_f.dlerr"; return 4
+		}
+	else
+		_deapman_err "ni curl ni wget disponibles para descargar $_dl_u"
+		return 4
+	fi
+	rm -f "$_dl_f.dlerr"
+	chmod +x "$_dl_f"
+	return 0
+}
+
+_deapman_thin_tools() { # deja _TO_AIT/_TO_URT/_TO_MKW listos; rc 4 sin red
+	_to_arch="$(uname -m)"
+	case "$_to_arch" in
+		x86_64|aarch64) ;;
+		*) _deapman_err "arquitectura sin appimagetool pkgforge: $_to_arch"; return 4 ;;
+	esac
+	_to_dir="$DEAPMAN_CACHE/tools"
+	mkdir -p "$_to_dir" || return 1
+	_TO_AIT="$_to_dir/appimagetool"; _TO_URT="$_to_dir/uruntime"; _TO_MKW="$_to_dir/mkdwarfs"
+	[ -x "$_TO_AIT" ] && [ -s "$_TO_AIT" ] || {
+		_deapman_note "descargando appimagetool (pkgforge) para $_to_arch..."
+		_deapman_thin_dl "https://github.com/pkgforge-dev/appimagetool/releases/download/0.3.3/appimagetool-${_to_arch}-linux" "$_TO_AIT" || return 4
+	}
+	[ -x "$_TO_URT" ] && [ -s "$_TO_URT" ] || {
+		_deapman_note "descargando uruntime (dwarfs-lite) para $_to_arch..."
+		_deapman_thin_dl "https://github.com/VHSgunzo/uruntime/releases/download/v0.5.6/uruntime-appimage-dwarfs-lite-${_to_arch}" "$_TO_URT" || return 4
+	}
+	# mkdwarfs lo trae appimagetool a su TMPDIR en el primer repack; si ya lo
+	# persistimos en tools/ se reutiliza sin red (--mkdwarfs).
+	[ -x "$_TO_MKW" ] && [ -s "$_TO_MKW" ] || _TO_MKW=""
+	return 0
+}
+
+# ---------- thin symlink backend ----------
+_deapman_thin_cleanup() { # borra el staging del thin en curso
+	for _cl_d in "${_T_ST:-}" "${_T_TD:-}" "${_T_OD:-}" "${_T_VD:-}"; do
+		[ -n "$_cl_d" ] && [ -d "$_cl_d" ] && rm -rf "$_cl_d"
+	done
+	return 0
+}
+
+_deapman_thin_symlink() { # <appdir> → app.thin.AppImage; rc 0 ok, 1 operativo, 4 red
+	_T_APPDIR="$1"
+	_T_ST=""; _T_TD=""; _T_OD=""; _T_VD=""
+	[ -n "${_T_APPDIR:-}" ] && [ -d "$_T_APPDIR" ] && [ -f "$_T_APPDIR/manifest" ] || {
+		_deapman_err "appdir inválido: ${_T_APPDIR:-?}"; return 1
+	}
+	_T_NAME=$(basename "$_T_APPDIR")
+	_T_ORIG="$DEAPMAN_ORIG/$_T_NAME/app.orig.AppImage"
+	_T_OUT="$_T_APPDIR/app.thin.AppImage"
+	[ -f "$_T_ORIG" ] || {
+		_deapman_err "$_T_NAME: sin original ($DEAPMAN_ORIG/$_T_NAME/app.orig.AppImage)"
+		_deapman_thin_cleanup; return 1
+	}
+	head -c10 "$_T_ORIG" 2>/dev/null | grep -qa '^.ELF....AI$' 2>/dev/null || {
+		_deapman_err "$_T_NAME: el original no es un AppImage válido"
+		_deapman_thin_cleanup; return 1
+	}
+	_deapman_thin_tools; _t_rc=$?
+	[ "$_t_rc" -eq 0 ] || { _deapman_thin_cleanup; return "$_t_rc"; }
+	# Staging EN EL MISMO FS que $DEAPMAN_HOME (tmp/ cuelga de él); nunca /tmp
+	# (tmpfs de 1.8 GB en esta máquina).
+	_T_ST="$DEAPMAN_TMP/thin-st-$$-$_T_NAME"; _T_TD="$DEAPMAN_TMP/thin-tmp-$$-$_T_NAME"
+	_T_OD="$DEAPMAN_TMP/thin-out-$$-$_T_NAME"; _T_VD="$DEAPMAN_TMP/thin-vfy-$$-$_T_NAME"
+	rm -rf "$_T_ST" "$_T_TD" "$_T_OD" "$_T_VD"
+	mkdir -p "$_T_ST" "$_T_TD" "$_T_OD" "$_T_VD" || {
+		_deapman_err "$_T_NAME: no pude crear staging en $DEAPMAN_TMP"
+		_deapman_thin_cleanup; return 1
+	}
+	( cd "$_T_ST" && "$_T_ORIG" --appimage-extract >/dev/null 2>&1 ) || {
+		_deapman_err "$_T_NAME: extracción del original fallida (¿type1 antiguo?)"
+		_deapman_thin_cleanup; return 1
+	}
+	_T_AD=""
+	for _t_c in AppDir squashfs-root; do
+		if [ -d "$_T_ST/$_t_c" ]; then
+			_T_AD="$_T_ST/$_t_c"
+			[ -L "$_T_AD" ] && _T_AD=$(readlink -f "$_T_AD")
+			break
+		fi
+	done
+	[ -n "$_T_AD" ] && [ -d "$_T_AD" ] || {
+		_deapman_err "$_T_NAME: sin AppDir tras extraer el original"
+		_deapman_thin_cleanup; return 1
+	}
+	[ -s "$DEAPMAN_HOME/inventory.tsv" ] || {
+		_deapman_err "$_T_NAME: inventario vacío (ejecuta \`deapman dedup\` primero)"
+		_deapman_thin_cleanup; return 1
+	}
+	_T_MIN="${DEAPMAN_MIN_THIN_BYTES:-32768}"
+	awk -F'\t' -v min="$_T_MIN" '
+		{h=$4; sz=$3+0; n[h]++; if (sz>bytes[h]) bytes[h]=sz}
+		END {for (h in n) if (n[h]>=2 && bytes[h]>=min) print h}' \
+		"$DEAPMAN_HOME/inventory.tsv" | sort -u >"$_T_ST/dups" || {
+		_deapman_err "$_T_NAME: no pude calcular duplicados"
+		_deapman_thin_cleanup; return 1
+	}
+	[ -s "$_T_ST/dups" ] || {
+		_deapman_note "$_T_NAME: sin hashes duplicados (≥${_T_MIN}B, ≥2 veces en inventario); nada que adelgazar"
+		_deapman_thin_cleanup; return 0
+	}
+	(cd "$_T_AD" && find . -type f -print | sort) >"$_T_ST/files"
+	_T_N=0; _T_SAVED=0; : >"$_T_ST/refs"
+	while IFS= read -r _t_f; do
+		_t_rel=${_t_f#./}
+		[ -n "$_t_rel" ] && [ "$_t_rel" != "." ] || continue
+		_deapman_excluded "$_t_rel" "$_T_AD/$_t_rel" && continue
+		_t_sz=$(wc -c <"$_T_AD/$_t_rel" 2>/dev/null | tr -d ' ')
+		[ "${_t_sz:-0}" -ge "$_T_MIN" ] 2>/dev/null || continue
+		_t_h=$(sha256sum "$_T_AD/$_t_rel" 2>/dev/null | awk '{print $1}')
+		[ -n "$_t_h" ] || continue
+		grep -qxF -- "$_t_h" "$_T_ST/dups" 2>/dev/null || continue
+		_t_hh=$(printf '%s' "$_t_h" | cut -c1-2)
+		_t_bd="$DEAPMAN_COMMON/$_t_hh"; _t_b="$_t_bd/$_t_h"
+		if [ -f "$_t_b" ]; then
+			# El blob existe: solo se reutiliza si el contenido coincide.
+			_t_chk=$(sha256sum "$_t_b" 2>/dev/null | awk '{print $1}')
+			[ "$_t_chk" = "$_t_h" ] || rm -f "$_t_b"
+		fi
+		if [ ! -f "$_t_b" ]; then
+			mkdir -p "$_t_bd" || {
+				_deapman_err "$_T_NAME: no pude crear $_t_bd"
+				_deapman_thin_cleanup; return 1
+			}
+			cp -p "$_T_AD/$_t_rel" "$_t_b.$$" || {
+				_deapman_err "$_T_NAME: no pude copiar $_t_rel a common/"
+				rm -f "$_t_b.$$"; _deapman_thin_cleanup; return 1
+			}
+			chmod a-w "$_t_b.$$" # cp -p ya preserva +x; el blob queda a-w
+			mv -f "$_t_b.$$" "$_t_b" || {
+				_deapman_err "$_T_NAME: no pude publicar el blob $_t_h"
+				rm -f "$_t_b.$$"; _deapman_thin_cleanup; return 1
+			}
+		fi
+		rm -f "$_T_AD/$_t_rel" && ln -s "$_t_b" "$_T_AD/$_t_rel" || {
+			_deapman_err "$_T_NAME: no pude enlazar $_t_rel"
+			_deapman_thin_cleanup; return 1
+		}
+		printf '%s\n' "$_t_h" >>"$_T_ST/refs"
+		_T_N=$((_T_N+1)); _T_SAVED=$((_T_SAVED+_t_sz))
+	done <"$_T_ST/files"
+	[ "$_T_N" -gt 0 ] || {
+		_deapman_note "$_T_NAME: ningún fichero propio es duplicado thineable (excluidos o únicos); no se reempaqueta"
+		_deapman_thin_cleanup; return 0
+	}
+	_T_REFS=$(sort -u "$_T_ST/refs" | tr '\n' ' '); _T_REFS=${_T_REFS% }
+	_deapman_note "$_T_NAME: $_T_N ficheros ($_T_SAVED B sin comprimir) → $DEAPMAN_COMMON; reempaquetando..."
+	# $1 ya está a salvo en _T_APPDIR: se reutiliza la lista de args.
+	set -- "$_T_AD" -o "$_T_OD"
+	[ -n "$_TO_MKW" ] && [ -x "$_TO_MKW" ] && set -- --mkdwarfs "$_TO_MKW" "$@"
+	_t_useruntime=0
+	[ -x "$_TO_URT" ] && [ -s "$_TO_URT" ] && { set -- --runtime "$_TO_URT" "$@"; _t_useruntime=1; }
+	: >"$_T_ST/ait.log"
+	if TMPDIR="$_T_TD" "$_TO_AIT" "$@" >"$_T_ST/ait.log" 2>&1; then
+		_t_rc=0
+	elif [ "$_t_useruntime" -eq 1 ]; then
+		_deapman_note "$_T_NAME: --runtime propio falló, reintento con el runtime preferido de appimagetool..."
+		set -- "$_T_AD" -o "$_T_OD"
+		[ -n "$_TO_MKW" ] && [ -x "$_TO_MKW" ] && set -- --mkdwarfs "$_TO_MKW" "$@"
+		if TMPDIR="$_T_TD" "$_TO_AIT" "$@" >>"$_T_ST/ait.log" 2>&1; then _t_rc=0; else _t_rc=1; fi
+	else
+		_t_rc=1
+	fi
+	if [ "$_t_rc" -ne 0 ]; then
+		_deapman_err "$_T_NAME: appimagetool falló (cola del log):"
+		tail -15 "$_T_ST/ait.log" >&2
+		_deapman_thin_cleanup; return 1
+	fi
+	# mkdwarfs que appimagetool descargó a su TMPDIR: persistirlo evita red
+	# en próximos repacks.
+	if [ ! -x "$DEAPMAN_CACHE/tools/mkdwarfs" ] && [ -x "$_T_TD/mkdwarfs" ]; then
+		cp -f "$_T_TD/mkdwarfs" "$DEAPMAN_CACHE/tools/mkdwarfs" 2>/dev/null && \
+			chmod +x "$DEAPMAN_CACHE/tools/mkdwarfs" && \
+			_deapman_note "$_T_NAME: mkdwarfs persistido en cache/tools (próximos repacks sin red)"
+	fi
+	_T_NEW=""
+	for _t_o in "$_T_OD"/*.AppImage; do
+		[ -f "$_t_o" ] && { _T_NEW="$_t_o"; break; }
+	done
+	[ -n "$_T_NEW" ] || {
+		_deapman_err "$_T_NAME: appimagetool no produjo ningún .AppImage"
+		tail -15 "$_T_ST/ait.log" >&2
+		_deapman_thin_cleanup; return 1
+	}
+	head -c10 "$_T_NEW" 2>/dev/null | grep -qa '^.ELF....AI$' 2>/dev/null || {
+		_deapman_err "$_T_NAME: el thin no tiene magia ELF+AI"
+		_deapman_thin_cleanup; return 1
+	}
+	# Verificación antes de sustituir: extraer el thin y comparar el árbol
+	# con el staging (toda ruta debe existir; symlinks con mismo destino y
+	# resolubles; regulares byte-idénticos).
+	( cd "$_T_VD" && "$_T_NEW" --appimage-extract >/dev/null 2>&1 ) || {
+		_deapman_err "$_T_NAME: el thin no se deja extraer"
+		_deapman_thin_cleanup; return 1
+	}
+	_T_VAD=""
+	for _t_c in AppDir squashfs-root; do
+		if [ -d "$_T_VD/$_t_c" ]; then
+			_T_VAD="$_T_VD/$_t_c"
+			[ -L "$_T_VAD" ] && _T_VAD=$(readlink -f "$_T_VAD")
+			break
+		fi
+	done
+	[ -n "$_T_VAD" ] && [ -d "$_T_VAD" ] || {
+		_deapman_err "$_T_NAME: el thin no contiene AppDir al verificar"
+		_deapman_thin_cleanup; return 1
+	}
+	(cd "$_T_AD" && find . | sort) >"$_T_ST/st.all"
+	(cd "$_T_VAD" && find . | sort) >"$_T_ST/vd.all"
+	if ! cmp -s "$_T_ST/st.all" "$_T_ST/vd.all"; then
+		_deapman_err "$_T_NAME: el árbol del thin difiere del original:"
+		diff "$_T_ST/st.all" "$_T_ST/vd.all" | head -20 >&2
+		_deapman_thin_cleanup; return 1
+	fi
+	_t_bad=0
+	while IFS= read -r _t_f; do
+		_t_rel=${_t_f#./}
+		[ -n "$_t_rel" ] && [ "$_t_rel" != "." ] || continue
+		if [ -L "$_T_AD/$_t_rel" ]; then
+			[ -L "$_T_VAD/$_t_rel" ] || {
+				_deapman_err "$_T_NAME: symlink perdido en thin: $_t_rel"
+				_t_bad=$((_t_bad+1)); continue
+			}
+			[ "$(readlink "$_T_AD/$_t_rel")" = "$(readlink "$_T_VAD/$_t_rel")" ] || {
+				_deapman_err "$_T_NAME: symlink con otro destino: $_t_rel"
+				_t_bad=$((_t_bad+1)); continue
+			}
+			[ -e "$_T_AD/$_t_rel" ] || {
+				_deapman_err "$_T_NAME: symlink roto (¿falta blob en common/?): $_t_rel"
+				_t_bad=$((_t_bad+1)); continue
+			}
+		elif [ -d "$_T_AD/$_t_rel" ]; then
+			[ -d "$_T_VAD/$_t_rel" ] || {
+				_deapman_err "$_T_NAME: dir perdido en thin: $_t_rel"
+				_t_bad=$((_t_bad+1))
+			}
+		elif [ -f "$_T_AD/$_t_rel" ]; then
+			cmp -s "$_T_AD/$_t_rel" "$_T_VAD/$_t_rel" || {
+				_deapman_err "$_T_NAME: contenido difiere: $_t_rel"
+				_t_bad=$((_t_bad+1))
+			}
+		fi
+	done <"$_T_ST/st.all"
+	[ "$_t_bad" -eq 0 ] || { _deapman_thin_cleanup; return 1; }
+	_T_OSZ=$(wc -c <"$_T_ORIG" 2>/dev/null | tr -d ' ')
+	_T_NSZ=$(wc -c <"$_T_NEW" 2>/dev/null | tr -d ' ')
+	mv -f "$_T_NEW" "$_T_OUT" || {
+		_deapman_err "$_T_NAME: no pude instalar $_T_OUT"
+		_deapman_thin_cleanup; return 1
+	}
+	chmod a+x "$_T_OUT"
+	# El original debe quedar intacto: su sha debe seguir en el manifest.
+	_t_now=$(sha256sum "$_T_ORIG" 2>/dev/null | awk '{print $1}')
+	_t_exp=$(_deapman_app_field "$_T_APPDIR" sha_orig)
+	[ -n "$_t_now" ] && [ "$_t_now" = "$_t_exp" ] || {
+		_deapman_err "$_T_NAME: ¡el original cambió durante el thin! (revierte manualmente)"
+		rm -f "$_T_OUT"; _deapman_thin_cleanup; return 1
+	}
+	_t_nick=$(_deapman_app_field "$_T_APPDIR" nick)
+	_t_ver=$(_deapman_app_field "$_T_APPDIR" version)
+	_t_org=$(_deapman_app_field "$_T_APPDIR" origin)
+	chmod u+w "$_T_APPDIR/manifest" || {
+		_deapman_err "$_T_NAME: manifest no escribible"
+		rm -f "$_T_OUT"; _deapman_thin_cleanup; return 1
+	}
+	cat >"$_T_APPDIR/manifest" <<EOF
+name='$_T_NAME'
+nick='${_t_nick:-$_T_NAME}'
+version='${_t_ver:-unknown}'
+origin='$_t_org'
+mode='symlink'
+thin='1'
+sha_orig='$_t_now'
+updated='$(date +%F)'
+refs='$_T_REFS'
+EOF
+	chmod a-w "$_T_APPDIR/manifest" 2>/dev/null || true
+	_t_nrefs=$(printf '%s' "$_T_REFS" | wc -w | tr -d ' ')
+	_deapman_note "$_T_NAME: thin ok: $_T_N ficheros ($_T_SAVED B sin comprimir) → common; ${_T_OSZ:-?} → ${_T_NSZ:-?} B; refs=$_t_nrefs hashes; original intacto"
+	_deapman_thin_cleanup
+	return 0
+}
+
+# ---------- dispatch ----------
+case "$1" in
+	'dedup'|'thin')
+		shift
+		_deapman_ensure_dirs
+		_deapman_dedup "$@"
+		;;
+	'__inventory-one')
+		# Inventario de UNA app a inventory.d/ (para lotes paralelos).
+		shift
+		_deapman_ensure_dirs
+		mkdir -p "$DEAPMAN_HOME/inventory.d"
+		[ $# -ge 1 ] || { _deapman_err "uso: __inventory-one <nombre|apodo>"; exit 2; }
+		_d=$(_deapman_appdir "$1") || { _deapman_err "\"$1\" no instalado"; exit 3; }
+		_deapman_inventory_one "$_d" "$DEAPMAN_HOME/inventory.d/$(basename "$_d").tsv"
+		;;
+	'__thin-one')
+		# Repack de UNA app usando el inventario ya existente (para lotes
+		# paralelos: el inventario global se construye una vez con `dedup`).
+		shift
+		_deapman_ensure_dirs
+		[ $# -ge 1 ] || { _deapman_err "uso: __thin-one <nombre|apodo> [-w]"; exit 2; }
+		_w=""; [ "${2:-}" = "-w" ] && _w=1
+		_d=$(_deapman_appdir "$1") || { _deapman_err "\"$1\" no instalado"; exit 3; }
+		# Recicla también aquí: ya-thin → salto (DEAPMAN_FORCE=1 lo rehace).
+		_want="symlink"; [ -n "$_w" ] && _want="wrapper"
+		if [ -z "${DEAPMAN_FORCE:-}" ] && [ -f "$_d/app.thin.AppImage" ] && \
+		   ( unset mode thin; . "$_d/manifest"; [ "${mode:-}" = "$_want" ] && [ "${thin:-0}" = 1 ] ); then
+			_deapman_note "$(basename "$_d"): ya thin ($_want), salto"
+			exit 0
+		fi
+		if [ -n "$_w" ]; then
+			type _deapman_thin_wrapper >/dev/null 2>&1 || { _deapman_err "backend -w no implementado"; exit 2; }
+			_deapman_thin_wrapper "$_d"
+		else
+			_deapman_thin_symlink "$_d"
+		fi
+		;;
+	*)
+		echo "deapman-dedup: opción desconocida \"$1\"" >&2
+		exit 2
+		;;
+esac
